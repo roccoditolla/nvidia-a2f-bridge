@@ -6,9 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy NVIDIA protobuf wheel (you need to download this from NVIDIA)
-COPY nvidia_ace-1.2.0-py3-none-any.whl .
-RUN pip install nvidia_ace-1.2.0-py3-none-any.whl
+# No longer needed - using REST API instead of gRPC
 
 # Copy app
 COPY main.py .
