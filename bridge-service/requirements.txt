@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+grpcio==1.68.0
+grpcio-tools==1.68.0
+pydantic==2.10.0
+python-multipart==0.0.12
+
+# NVIDIA ACE protobuf (install from wheel provided by NVIDIA)
+# See: https://github.com/NVIDIA/Audio2Face-3D-Samples
+# pip install nvidia_ace-1.2.0-py3-none-any.whl
