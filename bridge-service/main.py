@@ -1,17 +1,14 @@
 """
-NVIDIA Audio2Face-3D gRPC Bridge
-Converts HTTP REST requests to gRPC calls for NVIDIA A2F-3D API
+NVIDIA Audio2Face-3D REST Bridge
+Proxies HTTP REST requests to NVIDIA A2F-3D REST API
 """
 import os
 import base64
-import io
-import wave
 from typing import Dict, List, Any
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import grpc
-from nvidia_ace.a2f.v1 import audio2face_pb2, audio2face_pb2_grpc
+import httpx
 
 app = FastAPI(title="NVIDIA A2F-3D Bridge")
 
@@ -27,7 +24,7 @@ app.add_middleware(
 # Configuration from environment
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 A2F_FUNCTION_ID = os.getenv("A2F_FUNCTION_ID", "0961a6da-fb9e-4f2e-8491-247e5fd7bf8d")  # Claire default
-A2F_ENDPOINT = "grpc.nvcf.nvidia.com:443"
+A2F_REST_ENDPOINT = "https://api.nvcf.nvidia.com/v2/nvcf"
 A2F_OUTPUT_FPS = int(os.getenv("A2F_OUTPUT_FPS", "60"))
 BRIDGE_TOKEN = os.getenv("A2F_BRIDGE_TOKEN")
 
@@ -62,34 +59,25 @@ def verify_token(authorization: str = Header(None)):
     if token != BRIDGE_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-def convert_to_pcm16(audio_data: bytes, input_format: str) -> bytes:
-    """Convert audio to PCM 16-bit format required by NVIDIA"""
-    # For now, assume input is already compatible
-    # In production, use pydub or similar for conversion
-    return audio_data
-
-def create_grpc_metadata() -> List[tuple]:
-    """Create gRPC metadata with auth"""
-    return [
-        ("authorization", f"Bearer {NVIDIA_API_KEY}"),
-        ("function-id", A2F_FUNCTION_ID),
-    ]
-
-def parse_a2f_response(response) -> List[BlendshapeFrame]:
-    """Parse NVIDIA A2F-3D response into blendshape frames"""
+def parse_a2f_response(response_data: Dict[str, Any]) -> List[BlendshapeFrame]:
+    """Parse NVIDIA A2F-3D REST response into blendshape frames"""
     frames = []
     
-    # Extract blendshape data from response
-    # This depends on NVIDIA's protobuf structure
-    for i, frame_data in enumerate(response.blendshapes):
-        timestamp = i / A2F_OUTPUT_FPS  # Calculate timestamp based on FPS
+    # Extract blendshape data from REST response
+    blendshapes_data = response_data.get("blendshapes", [])
+    
+    for i, frame_data in enumerate(blendshapes_data):
+        timestamp = i / A2F_OUTPUT_FPS
         
-        # Convert NVIDIA blendshapes to dict
+        # Map blendshape values
         blendshapes = {}
-        for j, value in enumerate(frame_data.values):
-            # Map ARKit blendshape names (NVIDIA uses ARKit standard)
-            blendshape_name = f"blendshape_{j}"  # Placeholder, will be replaced with actual names
-            blendshapes[blendshape_name] = float(value)
+        if isinstance(frame_data, dict):
+            blendshapes = {k: float(v) for k, v in frame_data.items()}
+        elif isinstance(frame_data, list):
+            # If array format, map to ARKit blendshape names
+            for j, value in enumerate(frame_data):
+                blendshape_name = f"blendshape_{j}"
+                blendshapes[blendshape_name] = float(value)
         
         frames.append(BlendshapeFrame(
             timestamp=timestamp,
@@ -103,7 +91,7 @@ async def process_audio(
     request: AudioRequest,
     authorization: str = Header(None)
 ):
-    """Process audio through NVIDIA A2F-3D and return blendshapes"""
+    """Process audio through NVIDIA A2F-3D REST API and return blendshapes"""
     try:
         # Verify token
         verify_token(authorization)
@@ -111,33 +99,39 @@ async def process_audio(
         if not NVIDIA_API_KEY:
             raise HTTPException(status_code=500, detail="NVIDIA_API_KEY not configured")
         
-        # Decode audio
-        audio_bytes = base64.b64decode(request.audio)
-        
-        # Convert to PCM16 if needed
-        pcm_audio = convert_to_pcm16(audio_bytes, request.format)
-        
-        # Create gRPC channel
-        credentials = grpc.ssl_channel_credentials()
-        channel = grpc.secure_channel(A2F_ENDPOINT, credentials)
-        stub = audio2face_pb2_grpc.Audio2FaceStub(channel)
-        
-        # Prepare request
         function_id = request.function_id or A2F_FUNCTION_ID
-        metadata = create_grpc_metadata()
         
-        # Create A2F request
-        a2f_request = audio2face_pb2.ProcessAudioRequest(
-            audio_data=pcm_audio,
-            output_fps=A2F_OUTPUT_FPS,
-        )
+        # Prepare REST API request
+        url = f"{A2F_REST_ENDPOINT}/functions/{function_id}/invoke"
+        headers = {
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "Content-Type": "application/json",
+        }
         
-        # Call NVIDIA A2F-3D
-        print(f"🎙️ Calling NVIDIA A2F-3D (function_id: {function_id})")
-        response = stub.ProcessAudio(a2f_request, metadata=metadata)
+        payload = {
+            "audio": request.audio,
+            "format": request.format,
+            "output_fps": A2F_OUTPUT_FPS,
+        }
+        
+        # Call NVIDIA A2F-3D REST API
+        print(f"🎙️ Calling NVIDIA A2F-3D REST API (function_id: {function_id})")
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            
+            if response.status_code != 200:
+                error_text = response.text
+                print(f"❌ NVIDIA API Error [{response.status_code}]: {error_text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"NVIDIA A2F-3D Error: {error_text}"
+                )
+            
+            response_data = response.json()
         
         # Parse response
-        frames = parse_a2f_response(response)
+        frames = parse_a2f_response(response_data)
         duration = len(frames) / A2F_OUTPUT_FPS if frames else 0
         
         print(f"✅ Generated {len(frames)} frames at {A2F_OUTPUT_FPS} FPS")
@@ -149,11 +143,11 @@ async def process_audio(
             duration=duration
         )
         
-    except grpc.RpcError as e:
-        print(f"❌ gRPC Error: {e.code()}: {e.details()}")
+    except httpx.HTTPError as e:
+        print(f"❌ HTTP Error: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"NVIDIA A2F-3D Error: {e.details()}"
+            detail=f"NVIDIA A2F-3D Connection Error: {str(e)}"
         )
     except Exception as e:
         print(f"❌ Bridge Error: {str(e)}")
